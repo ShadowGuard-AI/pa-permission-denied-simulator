@@ -109,6 +109,7 @@ def collect_targets(target_path: Path, recursive: bool, exclude_spec: Optional[p
 
     if target_path.is_file():
         if wanted(target_path):
+            # For a plain file the target list is just itself, so the exclude test runs on it too. An exclude pattern that matches the named file produces an empty list and the run refuses later instead of changing the one thing it was pointed at.
             targets.append(target_path)
         return targets
 
@@ -131,6 +132,7 @@ def record_modes(targets: List[Path]) -> dict:
     """Records the exact current mode of every target."""
     modes = {}
     for path in targets:
+        # I record only the permission bits, not ownership or timestamps or the file type bits. Restore puts modes back and nothing else, so a run that changed more than modes would not be undone by the record file.
         modes[str(path)] = stat.S_IMODE(os.stat(path).st_mode)
     return modes
 
@@ -181,6 +183,7 @@ def probe_target(path: Path, write: bool) -> List[str]:
             try:
                 os.close(read_fd)
                 os.setgid(65534)
+                # Dropping to nobody has to happen before any attempt, and the setgid comes first because after setuid I may no longer be allowed to change the group. The child then reports through the pipe and exits with os._exit so it never runs the parent cleanup or flushes the parent buffers twice.
                 os.setuid(65534)
                 lines = []
                 for op in ops:
@@ -197,6 +200,7 @@ def probe_target(path: Path, write: bool) -> List[str]:
             data += chunk
         os.close(read_fd)
         os.waitpid(pid, 0)
+        # If the child dies before writing, the missing keys read back as no result rather than an error. A crashed probe and a probe that never ran look the same in the report, which is a weakness I accept for a simulator.
         results = {}
         for part in data.decode().split("\n"):
             if "=" in part:
@@ -273,6 +277,7 @@ def main() -> int:
         if args.confirm_target is None:
             console.print(Panel(Text("Error: --keep-changes requires --confirm-target carrying the exact target path. Nothing was changed.", style="bold red"), title="Error", border_style="red"))
             return 1
+        # The confirmation has to equal the resolved path, symlinks and all. A relative path the caller typed, or the same folder reached through a link, does not match, and that friction is the point: it proves the caller saw the real target.
         if args.confirm_target != str(target_path):
             console.print(Panel(Text(f"Error: --confirm-target does not match the exact target path {target_path}. Nothing was changed.", style="bold red"), title="Error", border_style="red"))
             return 1
@@ -297,11 +302,13 @@ def main() -> int:
         print("No targets matched. Nothing was changed.")
         return 1
 
+    # Recording happens after collection and before any change, in the callers own process. If a target vanishes between the walk and this stat, the run dies here with nothing changed, which is the outcome I want.
     original_modes = record_modes(targets)
 
     if args.keep_changes:
         record = {"target": str(target_path), "permissions": permissions, "modes": original_modes}
         try:
+            # The record is written before a single mode changes, and a failed write aborts the run. Keeping changes with no record would leave nothing to restore from, so this ordering is the safety property of the whole keep mode.
             with open(args.record_file, "w") as f:
                 json.dump(record, f, indent=2)
         except OSError as e:
@@ -322,6 +329,7 @@ def main() -> int:
             else:
                 failed += 1
 
+        # I only add a write probe when the mode I set has no write bit anywhere. If the caller sets a writable mode, write attempts would succeed by design and tell me nothing about denial, so the report stays read only.
         want_write = mode & 0o222 == 0
         print("Simulation report:")
         for path in targets:
